@@ -1,3 +1,4 @@
+# Android / Gradle
 *.iml
 .gradle
 /local.properties
@@ -13,3 +14,26 @@
 .externalNativeBuild
 .cxx
 local.properties
+PalmdrinoAndroid/build/
+PalmdrinoAndroid/app/build/
+PalmdrinoAndroid/.gradle/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Runtime data. Never commit these: the keystore holds the KEK that protects
+# every customer DEK, and the database holds encrypted biometric templates.
+.palmdrino/
+*.db
+*.db-wal
+*.db-shm
+keystore.json
+shard_pepper.key
+PalmdrinoAndroid/.idea/
