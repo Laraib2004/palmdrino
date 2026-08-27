@@ -1,4 +1,4 @@
-package it.palmdrino.payment.ui
+package it.palmdrino.payment.ui.terminal
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -26,6 +26,12 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import it.palmdrino.payment.camera.PalmCameraController
+import it.palmdrino.payment.ui.BusyOverlay
+import it.palmdrino.payment.ui.CameraPanel
+import it.palmdrino.payment.ui.DetailRow
+import it.palmdrino.payment.ui.StatusCard
+import it.palmdrino.payment.ui.formatMinor
+import it.palmdrino.payment.ui.parseEuroToMinor
 import it.palmdrino.payment.data.ApiException
 import it.palmdrino.payment.data.ApiSettings
 import it.palmdrino.payment.data.PalmdrinoClient
@@ -35,7 +41,7 @@ import it.palmdrino.payment.data.asPart
 import kotlinx.coroutines.launch
 
 @Composable
-fun PayScreen(settings: ApiSettings, onDone: () -> Unit) {
+fun PayScreen(settings: ApiSettings, onSettings: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val controller = remember { PalmCameraController() }
@@ -55,7 +61,7 @@ fun PayScreen(settings: ApiSettings, onDone: () -> Unit) {
     result?.let { payment ->
         PaymentResult(
             payment = payment,
-            onDone = onDone,
+            onSettings = onSettings,
             onAgain = {
                 result = null
                 amountText = ""
@@ -147,7 +153,9 @@ fun PayScreen(settings: ApiSettings, onDone: () -> Unit) {
             )
         }
 
-        OutlinedButton(onClick = onDone, modifier = Modifier.fillMaxWidth()) { Text("Back") }
+        OutlinedButton(onClick = onSettings, modifier = Modifier.fillMaxWidth()) {
+            Text("Terminal settings")
+        }
     }
 }
 
@@ -179,7 +187,7 @@ private fun paymentErrorAdvice(code: String, message: String): String = when (co
 @Composable
 private fun PaymentResult(
     payment: PaymentResponse,
-    onDone: () -> Unit,
+    onSettings: () -> Unit,
     onAgain: () -> Unit,
 ) {
     val approved = payment.status == "approved"
@@ -239,7 +247,7 @@ private fun PaymentResult(
 
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Button(onClick = onAgain, modifier = Modifier.weight(1f)) { Text("New payment") }
-            OutlinedButton(onClick = onDone, modifier = Modifier.weight(1f)) { Text("Done") }
+            OutlinedButton(onClick = onSettings, modifier = Modifier.weight(1f)) { Text("Settings") }
         }
     }
 }

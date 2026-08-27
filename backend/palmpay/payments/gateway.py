@@ -150,6 +150,28 @@ class CardToken:
     def display(self) -> str:
         return f"{self.scheme.value.title()} ****{self.last4}"
 
+    def to_payload(self) -> dict:
+        """The form stored, encrypted, in a customer profile."""
+        return {
+            "token": self.token,
+            "scheme": self.scheme.value,
+            "last4": self.last4,
+            "exp_month": self.exp_month,
+            "exp_year": self.exp_year,
+            "scheme_reference": self.scheme_reference,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "CardToken":
+        return cls(
+            token=payload["token"],
+            scheme=CardScheme(payload["scheme"]),
+            last4=payload["last4"],
+            exp_month=int(payload["exp_month"]),
+            exp_year=int(payload["exp_year"]),
+            scheme_reference=payload.get("scheme_reference", ""),
+        )
+
 
 @dataclass(frozen=True)
 class AuthorizationRequest:

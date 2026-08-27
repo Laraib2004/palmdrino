@@ -216,6 +216,152 @@ tracked: liveness at enrolment (PD-02) and cardholder verification when the card
 is linked (PD-06). Enrolling a palm against a stolen card is the attack to keep
 in view, and the card leg is where it gets stopped.
 
+---
+
+## D8. Three separate grants, not one shared key
+
+**Decision:** the API recognises three distinct authorities, and none of them is
+a superset of another.
+
+| Grant | Proves | Reaches |
+|---|---|---|
+| **Customer** — `Authorization: Bearer <customer_id>.<secret>` | you are this customer | that customer's own account only |
+| **Terminal** — `X-Api-Key` | you are a merchant terminal | `/v1/pay` |
+| **Admin** — `X-Admin-Key` | you are an operator | `/v1/audit` |
+
+`/v1/enroll` and `/v1/capture/check` are deliberately open: a customer
+enrolling themselves has no credential yet, and enrollment is the call that
+mints one. That makes them the most exposed endpoints in the service and the
+first that need rate limiting (PD-07).
+
+**Why this had to change.** Previously a single shared API key gated everything,
+including `/v1/customers/{id}` GET and DELETE — so knowing a customer id was
+enough to read their linked card and erase their profile. That held up while
+the only callers were a handful of trusted terminals. Under D7 it collapses: a
+customer-facing app ships its key to every install, so every user would hold
+credentials that read and erase every other user.
+
+**Customer credentials are device-bound, not passwords.** The server mints 32
+random bytes at enrollment and returns them once; the device keeps them, the
+server keeps only a peppered hash. No password for the customer to choose or
+reuse, no SMS provider to pay for, and a database leak yields nothing
+replayable. Verification is constant-time, and a mismatch answers 403 whether
+or not the target id exists, so ids cannot be probed.
+
+The cost is deliberate: **lose the device, lose access.** For a payment
+credential that is the right failure mode, but it needs a recovery path before
+real customers exist — PD-30.
+
+Since the secret is server-generated and high-entropy, it is stored under a
+plain keyed hash rather than a password KDF. There is no dictionary to attack,
+so bcrypt-style stretching would buy nothing.
+
+---
+
+## D9. Fraud controls are durable and shared, or they are not controls
+
+**Decision:** the PSD2 low-value counters and the rate limiter both live in the
+database, not in process memory.
+
+Both started in memory, and both were wrong for the same reason. A low-value
+exemption counter that resets on restart, and that the next till cannot see,
+lets a customer refresh their allowance by walking to another checkout. A rate
+limiter with the same property forgets an attacker between deploys, and does not
+exist at all behind a second server. Neither is a cache; both are controls, and
+a control that can be reset by the party it constrains is decoration.
+
+**Rate limiting uses fixed windows**, which admit up to 2x the limit across a
+boundary. Accepted knowingly: the purpose is to stop enumeration and resource
+exhaustion, not to meter a quota to the request, and a sliding log costs a row
+per request to buy precision nothing here needs.
+
+**What is limited, and why it matters now.** The customer-facing shift (D7) left
+`/v1/enroll` and `/v1/capture/check` open to unauthenticated callers, because a
+customer signing themselves up has no credential yet. `/v1/pay` takes a pay code
+per attempt, and that code is one of the two SCA factors from D2 — a short
+secret with unlimited attempts is enumerable. Limits are keyed per pay code
+*and* per terminal, so one attacker cannot lock every customer out by grinding a
+single code.
+
+Bucket keys are hashed. Keying on the pay code in the clear would have turned
+the rate-limit table into a directory of live pay codes.
+
+---
+
+## D10. The customer app and the terminal are separate apps
+
+**Decision:** two Gradle product flavours, `customer` and `terminal`, with
+separate source sets, application ids and launcher activities.
+
+They are different products for different people. Flavours make the separation
+structural: the customer build does not contain the payment-taking screen at
+all, rather than hiding it behind a menu — verified by inspecting the built
+APKs. It also lets the two be signed and distributed independently, which
+matters because one goes to the public and the other to merchants.
+
+This mirrors D8 exactly: the terminal holds a terminal grant and cannot read a
+customer account; the customer holds a customer grant and cannot take payments.
+The build boundary and the authorisation boundary agree.
+
+**Credentials are stored encrypted.** Both flavours keep their secret — the
+customer credential, the terminal key — in `EncryptedSharedPreferences` backed
+by the Android Keystore, and backup is disabled. The previous build kept the API
+key in memory only, so it vanished on restart and the terminal silently began
+failing auth.
+
+**Flow state moved to a ViewModel**, so a half-finished enrollment survives
+activity recreation. Captured frames stay in memory and are never written to
+disk: they are biometric data, and the device has no key management worth the
+name for them.
+
+---
+
+## D11. Account lifecycle: pause, change card, erase
+
+**Decision:** three distinct operations, because they are three distinct
+intentions.
+
+**Withdrawing consent suspends; it does not erase.** GDPR treats consent
+withdrawal and erasure as different rights, and collapsing them would force a
+customer who merely wants to stop using their palm into destroying their record.
+A suspended profile stops matching immediately and keeps its data, so the
+decision is reversible. Restoring requires a *fresh* grant against the current
+policy version — consent that was withdrawn is spent.
+
+How long a suspended profile may be retained before erasure becomes mandatory is
+a legal question (PD-01), not a number to invent.
+
+**Changing the card does not touch the palm.** Cards expire and get reissued
+every few years; palms do not. Tying them together would mean a biometric
+re-enrollment for a purely financial event. Only the payment-token field is
+resealed, under the same DEK.
+
+**Refunds are authorised against our own payment record**, not the gateway's.
+The gateway knows a transaction exists but not who is entitled to reverse it, so
+trusting the caller's merchant id would let any terminal refund another
+merchant's takings to the cardholder. Unknown and foreign transaction ids answer
+identically, so ids cannot be probed from another till.
+
+---
+
+## D12. A customer may enrol more than one palm
+
+**Decision:** templates live in their own table, one row per enrolled hand.
+
+One hand is a single point of failure for someone with a bandage, a cast, or a
+dressing — situations where a person is *more* likely to be out shopping
+one-handed, not less. Identification scores a candidate as the best of their
+enrolled hands: presenting either should work, and taking the worst would reject
+a valid customer for the crime of owning a second palm.
+
+**Re-enrolling the same hand is refused.** Two near-identical templates on one
+profile would sit inside the margin check from D1, and every payment would then
+be declined as ambiguous — the customer would have quietly broken their own
+account.
+
+``engine_id`` moved onto the template rather than the profile, so an engine
+upgrade can be rolled out hand by hand.
+
 ## Still open
 
 Open work lives in [`BACKLOG.md`](BACKLOG.md), not here — one source of truth

@@ -16,7 +16,15 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import AuditEvent, ConsentRecord, CustomerProfile, ProfileStatus, utc_now
+from .models import (
+    AuditEvent,
+    ConsentRecord,
+    CustomerCredential,
+    PalmTemplate,
+    CustomerProfile,
+    ProfileStatus,
+    utc_now,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS profiles (
@@ -24,7 +32,6 @@ CREATE TABLE IF NOT EXISTS profiles (
     shard             TEXT NOT NULL,
     engine_id         TEXT NOT NULL,
     wrapped_dek       BLOB,
-    enc_template      BLOB,
     enc_payment_token BLOB,
     enc_pii           BLOB,
     hint_type         TEXT NOT NULL DEFAULT 'public',
@@ -33,9 +40,35 @@ CREATE TABLE IF NOT EXISTS profiles (
     updated_at        TEXT NOT NULL
 );
 
+-- PD-21: one row per enrolled hand. A customer with an injured hand should
+-- still be able to pay, which means more than one template per customer.
+CREATE TABLE IF NOT EXISTS palm_templates (
+    template_id  TEXT PRIMARY KEY,
+    customer_id  TEXT NOT NULL,
+    engine_id    TEXT NOT NULL,
+    label        TEXT NOT NULL DEFAULT 'primary',
+    enc_template BLOB NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_palm_templates_customer
+    ON palm_templates (customer_id);
+
 -- The index that makes 1:small-N identification possible.
 CREATE INDEX IF NOT EXISTS idx_profiles_shard
     ON profiles (shard, status);
+
+CREATE TABLE IF NOT EXISTS credentials (
+    credential_id TEXT PRIMARY KEY,
+    customer_id   TEXT NOT NULL,
+    token_hash    TEXT NOT NULL,
+    device_label  TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    revoked_at    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_credentials_customer
+    ON credentials (customer_id, revoked_at);
 
 CREATE TABLE IF NOT EXISTS consents (
     consent_id      TEXT PRIMARY KEY,
@@ -49,6 +82,42 @@ CREATE TABLE IF NOT EXISTS consents (
 
 CREATE INDEX IF NOT EXISTS idx_consents_customer
     ON consents (customer_id);
+
+-- PD-16: our own record of every approved charge. The gateway knows the
+-- transaction but not who is entitled to refund it, so without this a refund
+-- endpoint could not tell an authorised merchant from any other caller.
+CREATE TABLE IF NOT EXISTS payments (
+    transaction_id TEXT PRIMARY KEY,
+    customer_id    TEXT NOT NULL,
+    merchant_id    TEXT NOT NULL,
+    amount_minor   INTEGER NOT NULL,
+    currency       TEXT NOT NULL,
+    refunded_minor INTEGER NOT NULL DEFAULT 0,
+    voided         INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_payments_merchant
+    ON payments (merchant_id, created_at);
+
+-- PD-08: PSD2 low-value exemption counters. Durable and shared, because an
+-- in-memory counter resets on restart and is not seen by the next till, which
+-- makes the allowance trivially resettable by walking to another terminal.
+CREATE TABLE IF NOT EXISTS low_value_usage (
+    customer_id      TEXT PRIMARY KEY,
+    cumulative_minor INTEGER NOT NULL DEFAULT 0,
+    transaction_count INTEGER NOT NULL DEFAULT 0,
+    updated_at       TEXT NOT NULL
+);
+
+-- PD-07: fixed-window rate limiting. Durable for the same reason: a limiter
+-- that forgets on restart is not a limiter.
+CREATE TABLE IF NOT EXISTS rate_limits (
+    bucket       TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    hits         INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket, window_start)
+);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     event_id    TEXT PRIMARY KEY,
@@ -106,7 +175,6 @@ class Repository:
             shard=row["shard"],
             engine_id=row["engine_id"],
             wrapped_dek=bytes(row["wrapped_dek"] or b""),
-            enc_template=bytes(row["enc_template"] or b""),
             enc_payment_token=bytes(row["enc_payment_token"] or b""),
             enc_pii=bytes(row["enc_pii"] or b""),
             hint_type=row["hint_type"],
@@ -120,16 +188,15 @@ class Repository:
             self._conn.execute(
                 """
                 INSERT INTO profiles (
-                    customer_id, shard, engine_id, wrapped_dek, enc_template,
+                    customer_id, shard, engine_id, wrapped_dek,
                     enc_payment_token, enc_pii, hint_type, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     profile.customer_id,
                     profile.shard,
                     profile.engine_id,
                     profile.wrapped_dek,
-                    profile.enc_template,
                     profile.enc_payment_token,
                     profile.enc_pii,
                     profile.hint_type,
@@ -203,28 +270,307 @@ class Repository:
 
         The row itself is kept as a tombstone so the customer id is never
         reissued and so audit and consent records keep a valid referent.
+
+        Erasable from any state except already-shredded. Matching only ACTIVE
+        would refuse a customer who paused first (PD-22) and then asked for
+        deletion -- which is the most likely order for someone leaving.
         """
         with self._lock:
             cursor = self._conn.execute(
                 """
                 UPDATE profiles
                 SET wrapped_dek = NULL,
-                    enc_template = NULL,
                     enc_payment_token = NULL,
                     enc_pii = NULL,
                     status = ?,
                     updated_at = ?
-                WHERE customer_id = ? AND status = ?
+                WHERE customer_id = ? AND status != ?
                 """,
                 (
                     ProfileStatus.SHREDDED.value,
                     _iso(utc_now()),
                     customer_id,
-                    ProfileStatus.ACTIVE.value,
+                    ProfileStatus.SHREDDED.value,
+                ),
+            )
+            if cursor.rowcount:
+                # Destroying the DEK already renders these unreadable; dropping
+                # the rows avoids retaining bytes there is no purpose in
+                # holding.
+                self._conn.execute(
+                    "DELETE FROM palm_templates WHERE customer_id = ?", (customer_id,)
+                )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    # -- palm templates (PD-21) -----------------------------------------------
+
+    def add_template(self, template: PalmTemplate) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO palm_templates (
+                    template_id, customer_id, engine_id, label,
+                    enc_template, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    template.template_id,
+                    template.customer_id,
+                    template.engine_id,
+                    template.label,
+                    template.enc_template,
+                    _iso(template.created_at),
                 ),
             )
             self._conn.commit()
+
+    def templates_for(self, customer_id: str) -> list[PalmTemplate]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM palm_templates WHERE customer_id = ? ORDER BY created_at",
+                (customer_id,),
+            ).fetchall()
+        return [
+            PalmTemplate(
+                template_id=row["template_id"],
+                customer_id=row["customer_id"],
+                engine_id=row["engine_id"],
+                enc_template=bytes(row["enc_template"]),
+                label=row["label"],
+                created_at=_parse_dt(row["created_at"]) or utc_now(),
+            )
+            for row in rows
+        ]
+
+    def delete_templates(self, customer_id: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM palm_templates WHERE customer_id = ?", (customer_id,)
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    def set_profile_status(self, customer_id: str, status: ProfileStatus) -> bool:
+        """Move a profile between active and suspended.
+
+        Refuses to touch a shredded profile: there is no key left, so
+        reactivating one would produce an account that exists but can never be
+        read.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE profiles SET status = ?, updated_at = ? "
+                "WHERE customer_id = ? AND status != ?",
+                (status.value, _iso(utc_now()), customer_id, ProfileStatus.SHREDDED.value),
+            )
+            self._conn.commit()
             return cursor.rowcount > 0
+
+    def iter_profiles(self, status: ProfileStatus | None = None) -> list[CustomerProfile]:
+        """All profiles, for maintenance jobs such as the KEK re-wrap (PD-14)."""
+        with self._lock:
+            if status is None:
+                rows = self._conn.execute("SELECT * FROM profiles").fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM profiles WHERE status = ?", (status.value,)
+                ).fetchall()
+        return [self._row_to_profile(row) for row in rows]
+
+    def update_wrapped_dek(self, customer_id: str, wrapped_dek: bytes) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE profiles SET wrapped_dek = ?, updated_at = ? WHERE customer_id = ?",
+                (wrapped_dek, _iso(utc_now()), customer_id),
+            )
+            self._conn.commit()
+
+    # -- payments (PD-16) -----------------------------------------------------
+
+    def record_payment(
+        self,
+        transaction_id: str,
+        customer_id: str,
+        merchant_id: str,
+        amount_minor: int,
+        currency: str,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO payments (
+                    transaction_id, customer_id, merchant_id,
+                    amount_minor, currency, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    transaction_id,
+                    customer_id,
+                    merchant_id,
+                    amount_minor,
+                    currency,
+                    _iso(utc_now()),
+                ),
+            )
+            self._conn.commit()
+
+    def get_payment(self, transaction_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM payments WHERE transaction_id = ?", (transaction_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_refund(self, transaction_id: str, amount_minor: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE payments SET refunded_minor = refunded_minor + ? "
+                "WHERE transaction_id = ?",
+                (amount_minor, transaction_id),
+            )
+            self._conn.commit()
+
+    def mark_voided(self, transaction_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE payments SET voided = 1 WHERE transaction_id = ?",
+                (transaction_id,),
+            )
+            self._conn.commit()
+
+    # -- low-value exemption counters (PD-08) ---------------------------------
+
+    def low_value_usage(self, customer_id: str) -> tuple[int, int]:
+        """Return (cumulative minor units, transaction count) since last SCA."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cumulative_minor, transaction_count FROM low_value_usage "
+                "WHERE customer_id = ?",
+                (customer_id,),
+            ).fetchone()
+        if row is None:
+            return 0, 0
+        return int(row["cumulative_minor"]), int(row["transaction_count"])
+
+    def record_low_value_use(self, customer_id: str, amount_minor: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO low_value_usage (
+                    customer_id, cumulative_minor, transaction_count, updated_at
+                ) VALUES (?, ?, 1, ?)
+                ON CONFLICT(customer_id) DO UPDATE SET
+                    cumulative_minor = cumulative_minor + excluded.cumulative_minor,
+                    transaction_count = transaction_count + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (customer_id, amount_minor, _iso(utc_now())),
+            )
+            self._conn.commit()
+
+    def reset_low_value_use(self, customer_id: str) -> None:
+        """Clear the allowance. Called after a strongly authenticated charge."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM low_value_usage WHERE customer_id = ?", (customer_id,)
+            )
+            self._conn.commit()
+
+    # -- rate limiting (PD-07) ------------------------------------------------
+
+    def hit_rate_limit(self, bucket: str, window_start: str, limit: int) -> bool:
+        """Count one attempt. Returns True if the caller is now over ``limit``.
+
+        Counts first and compares after, so a burst of concurrent requests
+        cannot slip through by all reading the same pre-increment value.
+        """
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO rate_limits (bucket, window_start, hits)
+                VALUES (?, ?, 1)
+                ON CONFLICT(bucket, window_start) DO UPDATE SET
+                    hits = hits + 1
+                """,
+                (bucket, window_start),
+            )
+            row = self._conn.execute(
+                "SELECT hits FROM rate_limits WHERE bucket = ? AND window_start = ?",
+                (bucket, window_start),
+            ).fetchone()
+            self._conn.commit()
+        return int(row["hits"]) > limit
+
+    def purge_rate_limits(self, older_than: str) -> int:
+        with self._lock:
+            # CAST because window_start is TEXT: string comparison would order
+            # "9" after "10", quietly retaining or deleting the wrong windows.
+            cursor = self._conn.execute(
+                "DELETE FROM rate_limits WHERE CAST(window_start AS INTEGER) < ?",
+                (int(older_than),),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
+    # -- credentials ----------------------------------------------------------
+
+    def create_credential(self, credential: CustomerCredential) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO credentials (
+                    credential_id, customer_id, token_hash,
+                    device_label, created_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    credential.credential_id,
+                    credential.customer_id,
+                    credential.token_hash,
+                    credential.device_label,
+                    _iso(credential.created_at),
+                    _iso(credential.revoked_at) if credential.revoked_at else None,
+                ),
+            )
+            self._conn.commit()
+
+    def active_credentials(self, customer_id: str) -> list[CustomerCredential]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM credentials
+                WHERE customer_id = ? AND revoked_at IS NULL
+                ORDER BY created_at
+                """,
+                (customer_id,),
+            ).fetchall()
+        return [
+            CustomerCredential(
+                credential_id=row["credential_id"],
+                customer_id=row["customer_id"],
+                token_hash=row["token_hash"],
+                device_label=row["device_label"],
+                created_at=_parse_dt(row["created_at"]) or utc_now(),
+                revoked_at=_parse_dt(row["revoked_at"]),
+            )
+            for row in rows
+        ]
+
+    def revoke_credentials(self, customer_id: str) -> int:
+        """Revoke every credential for a customer.
+
+        Called on erasure: the profile is gone, so any device still holding a
+        credential for it must stop being able to authenticate.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE credentials SET revoked_at = ? "
+                "WHERE customer_id = ? AND revoked_at IS NULL",
+                (_iso(utc_now()), customer_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount
 
     # -- consent --------------------------------------------------------------
 

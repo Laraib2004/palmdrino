@@ -55,6 +55,9 @@ class CaptureCheckResponse(BaseModel):
 
 class EnrollmentResponse(BaseModel):
     customer_id: str
+    # Returned exactly once. The server keeps only a hash, so if the client
+    # loses this the device is locked out and the customer must re-enroll.
+    credential: str
     engine_id: str
     card_display: str
     card_scheme: str
@@ -95,6 +98,33 @@ class CustomerResponse(BaseModel):
     card_display: str | None = None
     created_at: str
     consent_active: bool
+
+
+class CardResponse(BaseModel):
+    customer_id: str
+    card_display: str
+    scheme: str
+
+
+class ConsentStateResponse(BaseModel):
+    customer_id: str
+    profile_status: str
+    consent_active: bool
+    detail: str
+
+
+class RefundResponse(BaseModel):
+    status: str
+    refund_id: str
+    transaction_id: str
+    amount_minor: int
+    currency: str
+
+
+class PalmsResponse(BaseModel):
+    customer_id: str
+    palms_enrolled: int
+    label: str
 
 
 class ErasureResponse(BaseModel):

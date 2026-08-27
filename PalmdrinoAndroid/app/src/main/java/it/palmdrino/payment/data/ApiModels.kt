@@ -54,6 +54,9 @@ data class CaptureCheckResponse(
 
 data class EnrollmentResponse(
     @Json(name = "customer_id") val customerId: String,
+    // Returned exactly once. Persist it immediately or the device is locked
+    // out of the account it just created.
+    val credential: String,
     @Json(name = "engine_id") val engineId: String,
     @Json(name = "card_display") val cardDisplay: String,
     @Json(name = "card_scheme") val cardScheme: String,
@@ -94,6 +97,27 @@ data class CustomerResponse(
     @Json(name = "card_display") val cardDisplay: String? = null,
     @Json(name = "created_at") val createdAt: String,
     @Json(name = "consent_active") val consentActive: Boolean,
+)
+
+data class CardResponse(
+    @Json(name = "customer_id") val customerId: String,
+    @Json(name = "card_display") val cardDisplay: String,
+    val scheme: String,
+)
+
+data class ConsentStateResponse(
+    @Json(name = "customer_id") val customerId: String,
+    @Json(name = "profile_status") val profileStatus: String,
+    @Json(name = "consent_active") val consentActive: Boolean,
+    val detail: String,
+)
+
+data class RefundResponse(
+    val status: String,
+    @Json(name = "refund_id") val refundId: String,
+    @Json(name = "transaction_id") val transactionId: String,
+    @Json(name = "amount_minor") val amountMinor: Long,
+    val currency: String,
 )
 
 data class ErasureResponse(

@@ -40,7 +40,6 @@ from ..payments.gateway import (
     AuthorizationRequest,
     AuthorizationResult,
     CardToken,
-    CardScheme,
     PaymentError,
     PaymentGateway,
 )
@@ -51,11 +50,35 @@ from ..payments.sca import (
     assess,
     hint_factor,
     palm_factor,
+    within_low_value_limits,
 )
 from ..store.models import CustomerProfile, shard_key
 from ..store.repository import Repository
 from .enrollment import FIELD_PAYMENT_TOKEN, FIELD_TEMPLATE
 import json
+
+
+@dataclass
+class DurableLowValueTracker:
+    """PSD2 low-value counters backed by the database (PD-08).
+
+    Implements ``LowValueTracker``. Durable and shared across terminals: an
+    in-memory counter resets on every restart and is invisible to the next
+    till, so a customer could refresh their exemption allowance simply by
+    moving to another checkout.
+    """
+
+    repository: Repository
+
+    def would_qualify(self, customer_id: str, amount_minor: int) -> bool:
+        used_minor, used_count = self.repository.low_value_usage(customer_id)
+        return within_low_value_limits(used_minor, used_count, amount_minor)
+
+    def record_exempt(self, customer_id: str, amount_minor: int) -> None:
+        self.repository.record_low_value_use(customer_id, amount_minor)
+
+    def reset(self, customer_id: str) -> None:
+        self.repository.reset_low_value_use(customer_id)
 
 
 class PaymentDeclined(Exception):
@@ -73,6 +96,9 @@ class IdentificationResult:
     distance: float
     runner_up_distance: float | None
     candidates_considered: int
+    # PD-13: candidates skipped because they were enrolled on a different
+    # engine build. Non-zero means an engine change has stranded customers.
+    stale_engine_candidates: int = 0
 
     @property
     def margin(self) -> float:
@@ -99,8 +125,8 @@ class PaymentService:
     engine: BiometricEngine
     gateway: PaymentGateway
     settings: Settings
+    low_value_tracker: LowValueTracker
     liveness_config: LivenessConfig = field(default_factory=LivenessConfig)
-    low_value_tracker: LowValueTracker = field(default_factory=LowValueTracker)
 
     # -- capture --------------------------------------------------------------
 
@@ -157,29 +183,56 @@ class PaymentService:
             raise PaymentDeclined("no_match", "no enrolled palm matches this identifier")
 
         scored: list[tuple[float, CustomerProfile]] = []
+        stale_engine = 0
         for profile in candidates:
-            if profile.engine_id != self.engine.engine_id:
-                # Enrolled on a different engine build; comparing would be
-                # meaningless, so this candidate is skipped.
-                #
-                # This is a stopgap. The customer silently stops being able to
-                # pay and nothing says why -- the skip is not counted in the
-                # audit record. A real engine upgrade needs a migration and a
-                # re-enrollment prompt. See BACKLOG PD-13.
+            stored_palms = self.repository.templates_for(profile.customer_id)
+            usable = [t for t in stored_palms if t.engine_id == self.engine.engine_id]
+            if stored_palms and not usable:
+                # Every enrolled hand is on a different engine build. Comparing
+                # would be meaningless, so this candidate is skipped -- but
+                # counted, so the decline says why and the audit log shows how
+                # many customers an engine change has stranded.
+                stale_engine += 1
                 continue
+
             cipher = self._open_profile(profile)
             if cipher is None:
                 continue
             try:
-                stored = Template.deserialize(cipher.open(FIELD_TEMPLATE, profile.enc_template))
-            except (DecryptionError, ValueError):
-                continue
+                # PD-21: a customer may have more than one hand enrolled. Their
+                # score is the best of them -- presenting either hand should
+                # work, and taking the worst would reject a valid customer for
+                # owning a second palm.
+                best_for_profile: float | None = None
+                for palm in usable:
+                    try:
+                        stored = Template.deserialize(
+                            cipher.open(FIELD_TEMPLATE, palm.enc_template)
+                        )
+                    except (DecryptionError, ValueError):
+                        continue
+                    distance = self.engine.matcher.distance(probe, stored)
+                    if best_for_profile is None or distance < best_for_profile:
+                        best_for_profile = distance
             finally:
                 cipher.close()
 
-            scored.append((self.engine.matcher.distance(probe, stored), profile))
+            if best_for_profile is not None:
+                scored.append((best_for_profile, profile))
 
         if not scored:
+            if stale_engine:
+                # Not "no match" -- these customers are enrolled and would
+                # match, on the engine they enrolled with.
+                raise PaymentDeclined(
+                    "reenrollment_required",
+                    "this palm was enrolled on a previous recognition engine "
+                    "and must be enrolled again",
+                    {
+                        "stale_engine_candidates": stale_engine,
+                        "current_engine": self.engine.engine_id,
+                    },
+                )
             raise PaymentDeclined(
                 "no_match",
                 "no usable enrolled palm matches this identifier",
@@ -206,6 +259,7 @@ class PaymentService:
             distance=best_distance,
             runner_up_distance=runner_up,
             candidates_considered=len(scored),
+            stale_engine_candidates=stale_engine,
         )
 
         # Two enrolled palms both look like this one. Charging either would be
@@ -237,14 +291,88 @@ class PaymentService:
         finally:
             cipher.close()
 
-        return CardToken(
-            token=payload["token"],
-            scheme=CardScheme(payload["scheme"]),
-            last4=payload["last4"],
-            exp_month=int(payload["exp_month"]),
-            exp_year=int(payload["exp_year"]),
-            scheme_reference=payload.get("scheme_reference", ""),
+        return CardToken.from_payload(payload)
+
+    def refund(
+        self,
+        *,
+        transaction_id: str,
+        merchant_id: str,
+        amount_minor: int | None = None,
+    ) -> AuthorizationResult:
+        """Refund a charge, in whole or in part.
+
+        Authorised against our own payment record rather than the gateway's:
+        the gateway knows the transaction exists but not who is entitled to
+        reverse it, so trusting the caller's merchant id would let any terminal
+        refund any other merchant's takings to the cardholder.
+        """
+        record = self._owned_payment(transaction_id, merchant_id)
+        if record["voided"]:
+            raise PaymentDeclined("already_voided", "this transaction was voided")
+
+        remaining = record["amount_minor"] - record["refunded_minor"]
+        amount = amount_minor if amount_minor is not None else remaining
+        if amount <= 0:
+            raise PaymentDeclined("invalid_amount", "refund amount must be positive")
+        if amount > remaining:
+            raise PaymentDeclined(
+                "refund_exceeds_remaining",
+                "refund exceeds the remaining refundable amount",
+                {"remaining_minor": remaining},
+            )
+
+        try:
+            result = self.gateway.refund(transaction_id, amount)
+        except PaymentError as exc:
+            raise PaymentDeclined("gateway_error", str(exc)) from exc
+
+        self.repository.record_refund(transaction_id, amount)
+        self.repository.append_audit(
+            event_type="refund",
+            outcome=result.status.value,
+            customer_id=record["customer_id"],
+            merchant_id=merchant_id,
+            detail={
+                "transaction_id": transaction_id,
+                "refund_id": result.transaction_id,
+                "amount_minor": amount,
+            },
         )
+        return result
+
+    def void(self, *, transaction_id: str, merchant_id: str) -> AuthorizationResult:
+        """Cancel an uncaptured authorisation."""
+        record = self._owned_payment(transaction_id, merchant_id)
+        if record["voided"]:
+            raise PaymentDeclined("already_voided", "this transaction was already voided")
+        if record["refunded_minor"]:
+            raise PaymentDeclined(
+                "already_refunded", "this transaction has been refunded; it cannot be voided"
+            )
+
+        try:
+            result = self.gateway.void(transaction_id)
+        except PaymentError as exc:
+            raise PaymentDeclined("gateway_error", str(exc)) from exc
+
+        self.repository.mark_voided(transaction_id)
+        self.repository.append_audit(
+            event_type="void",
+            outcome="success",
+            customer_id=record["customer_id"],
+            merchant_id=merchant_id,
+            detail={"transaction_id": transaction_id},
+        )
+        return result
+
+    def _owned_payment(self, transaction_id: str, merchant_id: str) -> dict:
+        record = self.repository.get_payment(transaction_id)
+        # Same answer for "does not exist" and "belongs to someone else", so
+        # transaction ids cannot be probed from another merchant's terminal.
+        if record is None or record["merchant_id"] != merchant_id:
+            raise PaymentDeclined("unknown_transaction", "no such transaction")
+        return record
 
     def pay(
         self,
@@ -318,6 +446,13 @@ class PaymentService:
         # Keep the PSD2 low-value counters honest: a strongly authenticated
         # transaction resets the allowance, an exempt one consumes it.
         if authorization.approved:
+            self.repository.record_payment(
+                transaction_id=authorization.transaction_id,
+                customer_id=profile.customer_id,
+                merchant_id=merchant_id,
+                amount_minor=authorization.amount_minor,
+                currency=authorization.currency,
+            )
             if assessment.strongly_authenticated:
                 self.low_value_tracker.reset(profile.customer_id)
             elif assessment.exemption.value == "low_value":
@@ -342,6 +477,7 @@ class PaymentService:
                     else None
                 ),
                 "candidates_considered": identification.candidates_considered,
+                "stale_engine_candidates": identification.stale_engine_candidates,
                 "sca": assessment.as_dict(),
             },
         )

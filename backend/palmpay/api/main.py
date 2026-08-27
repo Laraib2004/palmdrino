@@ -20,6 +20,8 @@ customers. The API-key check below is a minimum, not a substitute for that.
 from __future__ import annotations
 
 import json
+import os
+import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -32,8 +34,12 @@ from ..palmprint.liveness import assess_liveness
 from ..crypto.envelope import DecryptionError
 from ..payments.gateway import CardDetails, PaymentError
 from ..payments.sca import HintType
+import hashlib
 from ..services.container import ServiceContainer
+from ..services.account import AccountError
+from ..services.credentials import AuthenticationError
 from ..services.enrollment import ConsentGrant, EnrollmentError
+from ..services.ratelimit import RateLimited
 from ..services.payment import PaymentDeclined
 from ..store.models import ProfileStatus
 from . import schemas
@@ -88,19 +94,116 @@ app = FastAPI(
 
 
 async def require_api_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
-    """Reject unauthenticated callers when an API key is configured.
+    """Terminal grant: authorises taking payments.
 
     Open by default so the prototype runs with no setup. Set ``PALMPAY_API_KEY``
     and it is enforced -- which any deployment reachable by anything other than
     localhost must do.
-    """
-    import os
 
+    This grant deliberately cannot reach customer account endpoints. It is held
+    by merchant terminals, of which there are few and which are trusted; a
+    customer's account is not something a terminal has any business reading.
+    """
     expected = os.environ.get("PALMPAY_API_KEY")
     if not expected:
         return
-    if x_api_key != expected:
-        raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "invalid API key"})
+    if not x_api_key or not secrets.compare_digest(x_api_key, expected):
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "unauthorized", "message": "invalid API key"},
+        )
+
+
+async def require_admin_key(x_admin_key: Annotated[str | None, Header()] = None) -> None:
+    """Admin grant: authorises reading the audit log.
+
+    Separate from the terminal key because under a customer-facing app the
+    terminal key is comparatively widely held, and the audit log is a record of
+    who paid what, where. Set ``PALMPAY_ADMIN_KEY`` to enforce.
+    """
+    expected = os.environ.get("PALMPAY_ADMIN_KEY")
+    if not expected:
+        return
+    if not x_admin_key or not secrets.compare_digest(x_admin_key, expected):
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "unauthorized", "message": "invalid admin key"},
+        )
+
+
+async def require_customer(
+    authorization: Annotated[str | None, Header()] = None,
+) -> str:
+    """Customer grant: proves the caller is a specific enrolled customer.
+
+    Returns the authenticated customer id. Unlike the two key checks above this
+    is never optional -- there is no deployment in which reading or erasing a
+    customer account should be open.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "unauthenticated",
+                "message": "a customer credential is required",
+            },
+        )
+    try:
+        return container().credentials.verify(authorization[7:].strip())
+    except AuthenticationError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "unauthenticated", "message": "invalid credential"},
+        ) from exc
+
+
+def authorize_self(caller: str, customer_id: str) -> None:
+    """Confirm an authenticated customer is acting on their own account.
+
+    Answers 403 for any mismatch rather than 404, so the response cannot be used
+    to probe which customer ids exist.
+    """
+    if caller != customer_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "forbidden",
+                "message": "this credential does not grant access to that customer",
+            },
+        )
+
+
+def limit_identity(value: str) -> str:
+    """Hash a value before it becomes a rate-limit bucket key.
+
+    The pay code is one of the two SCA factors. Bucketing on it in the clear
+    would turn the rate-limit table into a directory of live pay codes, so only
+    a digest is ever stored.
+    """
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def enforce_limit(scope: str, identity: str, merchant_id: str | None = None) -> None:
+    """Apply a rate limit, answering 429 with Retry-After when exceeded."""
+    services = container()
+    try:
+        services.rate_limiter.check(scope, identity)
+    except RateLimited as exc:
+        services.repository.append_audit(
+            event_type="rate_limit",
+            outcome="blocked",
+            merchant_id=merchant_id,
+            detail={"scope": exc.scope, "retry_after": exc.retry_after},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "rate_limited",
+                "message": str(exc),
+                "detail": {"retry_after": exc.retry_after},
+            },
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
 
 
 def decode_image(payload: bytes, label: str) -> np.ndarray:
@@ -155,12 +258,19 @@ async def health() -> schemas.HealthResponse:
 @app.post(
     "/v1/capture/check",
     response_model=schemas.CaptureCheckResponse,
-    dependencies=[Depends(require_api_key)],
 )
 async def capture_check(
     image: Annotated[UploadFile, File(description="A single palm frame")],
 ) -> schemas.CaptureCheckResponse:
-    """Score a frame without enrolling or charging anything."""
+    """Score a frame without enrolling or charging anything.
+
+    Open for the same reason as ``/v1/enroll``: the customer app calls this
+    while the user frames their hand during self-enrollment, before any
+    credential exists. It creates no template and writes nothing, but it does
+    run segmentation and an FFT per call, which makes it a cheap
+    CPU-exhaustion vector until PD-07 lands.
+    """
+    enforce_limit("capture_check", "global")
     services = container()
     frame = decode_image(await image.read(), "image")
 
@@ -189,7 +299,6 @@ async def capture_check(
 @app.post(
     "/v1/enroll",
     response_model=schemas.EnrollmentResponse,
-    dependencies=[Depends(require_api_key)],
 )
 async def enroll(
     frames: Annotated[list[UploadFile], File(description="Palm frames of the same hand")],
@@ -205,13 +314,20 @@ async def enroll(
     consent_purposes: Annotated[str, Form(description="comma-separated")] = "",
     consent_policy_version: Annotated[str, Form()] = "",
     consent_evidence: Annotated[str, Form()] = "",
+    device_label: Annotated[str, Form()] = "",
 ) -> schemas.EnrollmentResponse:
     """One-time enrollment: link a palm to a tokenised card.
+
+    Deliberately unauthenticated: a customer enrolling themselves has no
+    credential yet, and this is the call that mints one. That makes it the most
+    exposed endpoint in the service and the first that needs rate limiting
+    (PD-07).
 
     The card fields are accepted here only because this is a prototype. In
     production the PAN must be collected by a gateway-hosted field so it never
     reaches this service, which is what keeps PCI DSS scope small.
     """
+    enforce_limit("enroll", limit_identity(hint))
     services = container()
 
     if len(frames) > MAX_FRAMES:
@@ -267,6 +383,7 @@ async def enroll(
             card=card,
             pii=parsed_pii,
             consent=consent,
+            device_label=device_label,
         )
     except EnrollmentError as exc:
         status = 403 if exc.code.startswith("consent") else 422
@@ -277,6 +394,7 @@ async def enroll(
 
     return schemas.EnrollmentResponse(
         customer_id=result.customer_id,
+        credential=result.credential,
         engine_id=result.engine_id,
         card_display=result.card_display,
         card_scheme=result.card_scheme,
@@ -302,6 +420,10 @@ async def pay(
     description: Annotated[str, Form()] = "",
 ) -> schemas.PaymentResponse:
     """Identify the presented palm and charge the linked card."""
+    # Per pay code, so an attacker cannot grind one customer; and per terminal,
+    # so a compromised terminal cannot grind everyone.
+    enforce_limit("pay_by_hint", limit_identity(hint), merchant_id)
+    enforce_limit("pay_by_terminal", limit_identity(merchant_id), merchant_id)
     services = container()
     frame = decode_image(await image.read(), "image")
 
@@ -356,9 +478,12 @@ async def pay(
 @app.get(
     "/v1/customers/{customer_id}",
     response_model=schemas.CustomerResponse,
-    dependencies=[Depends(require_api_key)],
 )
-async def get_customer(customer_id: str) -> schemas.CustomerResponse:
+async def get_customer(
+    customer_id: str,
+    caller: Annotated[str, Depends(require_customer)],
+) -> schemas.CustomerResponse:
+    authorize_self(caller, customer_id)
     services = container()
     profile = services.repository.get_profile(customer_id)
     if profile is None:
@@ -387,10 +512,13 @@ async def get_customer(customer_id: str) -> schemas.CustomerResponse:
 @app.delete(
     "/v1/customers/{customer_id}",
     response_model=schemas.ErasureResponse,
-    dependencies=[Depends(require_api_key)],
 )
-async def erase_customer(customer_id: str) -> schemas.ErasureResponse:
+async def erase_customer(
+    customer_id: str,
+    caller: Annotated[str, Depends(require_customer)],
+) -> schemas.ErasureResponse:
     """GDPR erasure by crypto-shred: destroy the DEK, orphan the ciphertext."""
+    authorize_self(caller, customer_id)
     services = container()
     if services.repository.get_profile(customer_id) is None:
         raise HTTPException(
@@ -411,10 +539,251 @@ async def erase_customer(customer_id: str) -> schemas.ErasureResponse:
     )
 
 
+@app.post(
+    "/v1/customers/{customer_id}/palms",
+    response_model=schemas.PalmsResponse,
+)
+async def add_palm(
+    customer_id: str,
+    caller: Annotated[str, Depends(require_customer)],
+    frames: Annotated[list[UploadFile], File(description="Frames of the additional hand")],
+    label: Annotated[str, Form()] = "secondary",
+) -> schemas.PalmsResponse:
+    """Enrol an additional hand (PD-21).
+
+    A customer with only one enrolled palm cannot pay with a bandaged or
+    injured hand. Consent is not re-collected: the existing grant already
+    covers biometric processing for this customer and this adds no new purpose.
+    """
+    authorize_self(caller, customer_id)
+    services = container()
+
+    if len(frames) > MAX_FRAMES:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "too_many_frames", "message": f"at most {MAX_FRAMES} frames"},
+        )
+
+    images = [
+        decode_image(await item.read(), f"frame {index}")
+        for index, item in enumerate(frames, 1)
+    ]
+
+    try:
+        total = services.enrollment.add_palm(
+            customer_id=customer_id, frames=images, label=label
+        )
+    except EnrollmentError as exc:
+        raise HTTPException(
+            status_code=404 if exc.code == "not_found" else 422,
+            detail={"code": exc.code, "message": str(exc), "detail": exc.detail},
+        ) from exc
+
+    return schemas.PalmsResponse(
+        customer_id=customer_id, palms_enrolled=total, label=label
+    )
+
+
+@app.post(
+    "/v1/customers/{customer_id}/card",
+    response_model=schemas.CardResponse,
+)
+async def replace_card(
+    customer_id: str,
+    caller: Annotated[str, Depends(require_customer)],
+    card_number: Annotated[str, Form()],
+    card_exp_month: Annotated[int, Form()],
+    card_exp_year: Annotated[int, Form()],
+    card_cvv: Annotated[str, Form()],
+    card_holder: Annotated[str, Form()] = "",
+) -> schemas.CardResponse:
+    """Replace the one card on file, without re-scanning the palm (PD-28).
+
+    Cards expire and get reissued far more often than palms change. Tying the
+    two together would force a biometric re-enrollment for what is a purely
+    financial event.
+    """
+    authorize_self(caller, customer_id)
+    services = container()
+
+    try:
+        card = CardDetails(
+            pan=card_number,
+            exp_month=card_exp_month,
+            exp_year=card_exp_year,
+            cvv=card_cvv,
+            holder_name=card_holder,
+        )
+    except PaymentError as exc:
+        raise HTTPException(
+            status_code=400, detail={"code": "invalid_card", "message": str(exc)}
+        ) from exc
+
+    try:
+        token = services.account.replace_card(customer_id, card)
+    except AccountError as exc:
+        raise HTTPException(
+            status_code=404 if exc.code == "not_found" else 422,
+            detail={"code": exc.code, "message": str(exc), "detail": exc.detail},
+        ) from exc
+
+    return schemas.CardResponse(
+        customer_id=customer_id,
+        card_display=token.display(),
+        scheme=token.scheme.value,
+    )
+
+
+@app.post(
+    "/v1/customers/{customer_id}/consent/withdraw",
+    response_model=schemas.ConsentStateResponse,
+)
+async def withdraw_consent(
+    customer_id: str,
+    caller: Annotated[str, Depends(require_customer)],
+) -> schemas.ConsentStateResponse:
+    """Stop biometric processing while keeping the data (PD-22).
+
+    Distinct from erasure, because withdrawing consent and destroying data are
+    different rights and a customer may want the first without the second. The
+    palm stops working immediately; the record survives so the decision can be
+    reversed.
+    """
+    authorize_self(caller, customer_id)
+    services = container()
+    try:
+        services.account.withdraw_consent(customer_id)
+    except AccountError as exc:
+        raise HTTPException(
+            status_code=404 if exc.code == "not_found" else 409,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+
+    return schemas.ConsentStateResponse(
+        customer_id=customer_id,
+        profile_status="suspended",
+        consent_active=False,
+        detail=(
+            "Biometric processing has stopped and this palm can no longer pay. "
+            "The data is retained so consent can be restored or the data "
+            "exported; erase the profile to destroy it permanently."
+        ),
+    )
+
+
+@app.post(
+    "/v1/customers/{customer_id}/consent/restore",
+    response_model=schemas.ConsentStateResponse,
+)
+async def restore_consent(
+    customer_id: str,
+    caller: Annotated[str, Depends(require_customer)],
+    consent_purposes: Annotated[str, Form()] = "",
+    consent_policy_version: Annotated[str, Form()] = "",
+    consent_evidence: Annotated[str, Form()] = "",
+) -> schemas.ConsentStateResponse:
+    """Re-consent and reactivate a suspended profile.
+
+    Requires a fresh grant rather than reviving the withdrawn one: consent that
+    was withdrawn is spent, and the customer must see the current policy
+    version to give it again.
+    """
+    authorize_self(caller, customer_id)
+    services = container()
+
+    grant = ConsentGrant(
+        granted=True,
+        purposes=tuple(p.strip() for p in consent_purposes.split(",") if p.strip()),
+        policy_version=consent_policy_version,
+        evidence_text=consent_evidence,
+    )
+    try:
+        services.account.restore_consent(customer_id, grant)
+    except AccountError as exc:
+        raise HTTPException(
+            status_code=404 if exc.code == "not_found" else 409,
+            detail={"code": exc.code, "message": str(exc), "detail": exc.detail},
+        ) from exc
+
+    return schemas.ConsentStateResponse(
+        customer_id=customer_id,
+        profile_status="active",
+        consent_active=True,
+        detail="Consent restored. This palm can pay again.",
+    )
+
+
+@app.post(
+    "/v1/payments/{transaction_id}/refund",
+    response_model=schemas.RefundResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def refund_payment(
+    transaction_id: str,
+    merchant_id: Annotated[str, Form()],
+    amount_minor: Annotated[int | None, Form()] = None,
+) -> schemas.RefundResponse:
+    """Refund a charge, whole or partial (PD-16).
+
+    Authorised against our own payment record, so a terminal can only reverse
+    charges taken by its own merchant.
+    """
+    services = container()
+    try:
+        result = services.payment.refund(
+            transaction_id=transaction_id,
+            merchant_id=merchant_id,
+            amount_minor=amount_minor,
+        )
+    except PaymentDeclined as exc:
+        raise HTTPException(
+            status_code=404 if exc.code == "unknown_transaction" else 422,
+            detail={"code": exc.code, "message": str(exc), "detail": exc.detail},
+        ) from exc
+
+    return schemas.RefundResponse(
+        status=result.status.value,
+        refund_id=result.transaction_id,
+        transaction_id=transaction_id,
+        amount_minor=result.amount_minor,
+        currency=result.currency,
+    )
+
+
+@app.post(
+    "/v1/payments/{transaction_id}/void",
+    response_model=schemas.RefundResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def void_payment(
+    transaction_id: str,
+    merchant_id: Annotated[str, Form()],
+) -> schemas.RefundResponse:
+    """Cancel an uncaptured authorisation (PD-16)."""
+    services = container()
+    try:
+        result = services.payment.void(
+            transaction_id=transaction_id, merchant_id=merchant_id
+        )
+    except PaymentDeclined as exc:
+        raise HTTPException(
+            status_code=404 if exc.code == "unknown_transaction" else 422,
+            detail={"code": exc.code, "message": str(exc), "detail": exc.detail},
+        ) from exc
+
+    return schemas.RefundResponse(
+        status=result.status.value,
+        refund_id=result.transaction_id,
+        transaction_id=transaction_id,
+        amount_minor=result.amount_minor,
+        currency=result.currency,
+    )
+
+
 @app.get(
     "/v1/audit",
     response_model=list[schemas.AuditEntry],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin_key)],
 )
 async def audit(limit: int = 50) -> list[schemas.AuditEntry]:
     services = container()
@@ -444,4 +813,6 @@ async def http_exception_handler(_request, exc: HTTPException) -> JSONResponse:
         }
     else:
         body = {"code": "error", "message": str(detail), "detail": {}}
-    return JSONResponse(status_code=exc.status_code, content=body)
+    return JSONResponse(
+        status_code=exc.status_code, content=body, headers=exc.headers
+    )

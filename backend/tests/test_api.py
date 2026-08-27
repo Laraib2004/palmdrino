@@ -29,6 +29,11 @@ def client(services):
     set_container(None)
 
 
+def auth(enrolled: dict) -> dict:
+    """Authorization header for the customer created by ``enroll_via_api``."""
+    return {"Authorization": f"Bearer {enrolled['credential']}"}
+
+
 def enroll_via_api(client, identity=1, hint=HINT, hint_type="secret", pan=None):
     files = [
         ("frames", (f"f{index}.jpg", jpeg(frame), "image/jpeg"))
@@ -186,24 +191,31 @@ class TestPayment:
 
 class TestCustomerLifecycle:
     def test_fetch_and_erase(self, client):
-        customer_id = enroll_via_api(client).json()["customer_id"]
+        enrolled = enroll_via_api(client).json()
+        customer_id = enrolled["customer_id"]
+        headers = auth(enrolled)
 
-        fetched = client.get(f"/v1/customers/{customer_id}").json()
+        fetched = client.get(f"/v1/customers/{customer_id}", headers=headers).json()
         assert fetched["status"] == "active"
         assert fetched["card_display"] == "Visa ****1111"
         assert fetched["consent_active"]
 
-        erased = client.delete(f"/v1/customers/{customer_id}").json()
+        erased = client.delete(f"/v1/customers/{customer_id}", headers=headers).json()
         assert erased["erased"]
 
-        after = client.get(f"/v1/customers/{customer_id}").json()
-        assert after["status"] == "shredded"
-        assert after["card_display"] is None
-        assert not after["consent_active"]
+    def test_erasure_revokes_the_credential(self, client):
+        """A device holding a credential must not keep authenticating."""
+        enrolled = enroll_via_api(client).json()
+        customer_id = enrolled["customer_id"]
+        headers = auth(enrolled)
+
+        client.delete(f"/v1/customers/{customer_id}", headers=headers)
+        after = client.get(f"/v1/customers/{customer_id}", headers=headers)
+        assert after.status_code == 401
 
     def test_erased_palm_can_no_longer_pay(self, client):
-        customer_id = enroll_via_api(client).json()["customer_id"]
-        client.delete(f"/v1/customers/{customer_id}")
+        enrolled = enroll_via_api(client).json()
+        client.delete(f"/v1/customers/{enrolled['customer_id']}", headers=auth(enrolled))
         response = client.post(
             "/v1/pay",
             files={"image": ("p.jpg", jpeg(sample(1, seed=9)), "image/jpeg")},
@@ -211,12 +223,170 @@ class TestCustomerLifecycle:
         )
         assert response.status_code == 402
 
-    def test_unknown_customer_is_404(self, client):
-        assert client.get("/v1/customers/cus_nope").status_code == 404
-
 
 class TestAudit:
     def test_lists_events(self, client):
         enroll_via_api(client)
         events = client.get("/v1/audit").json()
         assert any(e["event_type"] == "enrollment" for e in events)
+
+
+class TestCustomerAuthorization:
+    """PD-29: a customer credential grants access to that customer, and no other.
+
+    Before this existed, knowing a customer id was enough to read someone's
+    linked card and erase their profile -- which only held up while the sole
+    callers were a few trusted terminals. Under a customer-facing app it does
+    not, so these are the tests that must not regress.
+    """
+
+    def test_enrollment_returns_a_credential_once(self, client):
+        body = enroll_via_api(client).json()
+        assert body["credential"].startswith(body["customer_id"] + ".")
+
+    def test_credential_is_not_stored_in_recoverable_form(self, client, services):
+        """A database leak must not yield anything replayable."""
+        body = enroll_via_api(client).json()
+        secret = body["credential"].split(".", 1)[1]
+        stored = services.repository.active_credentials(body["customer_id"])
+        assert len(stored) == 1
+        assert secret not in stored[0].token_hash
+
+    def test_unauthenticated_access_is_refused(self, client):
+        customer_id = enroll_via_api(client).json()["customer_id"]
+        assert client.get(f"/v1/customers/{customer_id}").status_code == 401
+        assert client.delete(f"/v1/customers/{customer_id}").status_code == 401
+
+    def test_malformed_credential_is_refused(self, client):
+        customer_id = enroll_via_api(client).json()["customer_id"]
+        for header in ("Bearer nonsense", "Bearer ", "notbearer x", f"Bearer {customer_id}"):
+            response = client.get(
+                f"/v1/customers/{customer_id}", headers={"Authorization": header}
+            )
+            assert response.status_code == 401, header
+
+    def test_one_customer_cannot_read_another(self, client):
+        victim = enroll_via_api(client, identity=1).json()
+        attacker = enroll_via_api(client, identity=2, pan=TEST_CARDS["mastercard_ok"]).json()
+
+        response = client.get(
+            f"/v1/customers/{victim['customer_id']}", headers=auth(attacker)
+        )
+        assert response.status_code == 403
+
+    def test_one_customer_cannot_erase_another(self, client, services):
+        """The worst version of the old hole: erasure is irreversible."""
+        victim = enroll_via_api(client, identity=1).json()
+        attacker = enroll_via_api(client, identity=2, pan=TEST_CARDS["mastercard_ok"]).json()
+
+        response = client.delete(
+            f"/v1/customers/{victim['customer_id']}", headers=auth(attacker)
+        )
+        assert response.status_code == 403
+        assert services.repository.get_profile(victim["customer_id"]).is_active
+
+    def test_forbidden_response_does_not_leak_existence(self, client):
+        """403 for both real and invented ids, so ids cannot be probed."""
+        enrolled = enroll_via_api(client).json()
+        other = enroll_via_api(client, identity=2, pan=TEST_CARDS["mastercard_ok"]).json()
+
+        real = client.get(f"/v1/customers/{other['customer_id']}", headers=auth(enrolled))
+        invented = client.get("/v1/customers/cus_does_not_exist", headers=auth(enrolled))
+        assert real.status_code == invented.status_code == 403
+        assert real.json()["code"] == invented.json()["code"]
+
+    def test_terminal_key_cannot_reach_customer_accounts(self, client, monkeypatch):
+        """Terminal and customer grants are separate, not a hierarchy."""
+        monkeypatch.setenv("PALMPAY_API_KEY", "terminal-secret")
+        customer_id = enroll_via_api(client).json()["customer_id"]
+        response = client.get(
+            f"/v1/customers/{customer_id}", headers={"X-Api-Key": "terminal-secret"}
+        )
+        assert response.status_code == 401
+
+    def test_customer_credential_cannot_take_payments(self, client, monkeypatch):
+        """And the reverse: a customer cannot charge cards."""
+        enrolled = enroll_via_api(client).json()
+        monkeypatch.setenv("PALMPAY_API_KEY", "terminal-secret")
+        response = client.post(
+            "/v1/pay",
+            files={"image": ("p.jpg", jpeg(sample(1, seed=44)), "image/jpeg")},
+            data={"hint": HINT, "amount_minor": 1000, "merchant_id": "mrc_1"},
+            headers=auth(enrolled),
+        )
+        assert response.status_code == 401
+
+    def test_audit_requires_the_admin_grant(self, client, monkeypatch):
+        """The audit log records who paid what, where. Not for terminals."""
+        monkeypatch.setenv("PALMPAY_ADMIN_KEY", "admin-secret")
+        monkeypatch.setenv("PALMPAY_API_KEY", "terminal-secret")
+        assert client.get("/v1/audit", headers={"X-Api-Key": "terminal-secret"}).status_code == 401
+        assert client.get("/v1/audit", headers={"X-Admin-Key": "admin-secret"}).status_code == 200
+
+    def test_self_enrollment_needs_no_prior_credential(self, client, monkeypatch):
+        """A customer installing the app has nothing yet -- enrollment must be open."""
+        monkeypatch.setenv("PALMPAY_API_KEY", "terminal-secret")
+        assert enroll_via_api(client).status_code == 200
+
+
+class TestRateLimiting:
+    """PD-07: enrollment and capture-check are open, so they must be bounded."""
+
+    def test_pay_attempts_against_one_code_are_capped(self, client):
+        """An attacker who guesses at a pay code must not get unlimited tries."""
+        enroll_via_api(client)
+        last = None
+        for _ in range(12):
+            last = client.post(
+                "/v1/pay",
+                files={"image": ("p.jpg", jpeg(sample(42, seed=1)), "image/jpeg")},
+                data={"hint": HINT, "amount_minor": 100, "merchant_id": "mrc_1"},
+            )
+        assert last.status_code == 429
+        assert last.json()["code"] == "rate_limited"
+        assert int(last.headers["Retry-After"]) > 0
+
+    def test_a_different_code_is_not_blocked(self, client):
+        """Limits are per identity, not global -- one attacker must not
+        lock every other customer out of paying."""
+        enroll_via_api(client)
+        for _ in range(12):
+            client.post(
+                "/v1/pay",
+                files={"image": ("p.jpg", jpeg(sample(42, seed=1)), "image/jpeg")},
+                data={"hint": "1111", "amount_minor": 100, "merchant_id": "mrc_1"},
+            )
+        response = client.post(
+            "/v1/pay",
+            files={"image": ("p.jpg", jpeg(sample(1, seed=44)), "image/jpeg")},
+            data={"hint": HINT, "amount_minor": 1000, "merchant_id": "mrc_1"},
+        )
+        assert response.status_code == 200
+
+    def test_enrollment_is_capped(self, client):
+        for index in range(5):
+            enroll_via_api(client, identity=index + 1)
+        assert enroll_via_api(client, identity=7).status_code == 429
+
+    def test_rate_limit_bucket_does_not_store_the_pay_code(self, client, services):
+        """The limiter table must not become a directory of live pay codes."""
+        enroll_via_api(client)
+        client.post(
+            "/v1/pay",
+            files={"image": ("p.jpg", jpeg(sample(1, seed=44)), "image/jpeg")},
+            data={"hint": HINT, "amount_minor": 100, "merchant_id": "mrc_1"},
+        )
+        rows = services.repository._conn.execute("SELECT bucket FROM rate_limits").fetchall()
+        assert rows
+        assert all(HINT not in row["bucket"] for row in rows)
+
+    def test_blocks_are_audited(self, client, services):
+        enroll_via_api(client)
+        for _ in range(12):
+            client.post(
+                "/v1/pay",
+                files={"image": ("p.jpg", jpeg(sample(42, seed=1)), "image/jpeg")},
+                data={"hint": HINT, "amount_minor": 100, "merchant_id": "mrc_1"},
+            )
+        events = services.repository.recent_audit(limit=100)
+        assert any(e.event_type == "rate_limit" and e.outcome == "blocked" for e in events)

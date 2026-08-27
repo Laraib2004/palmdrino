@@ -35,8 +35,9 @@ from ..crypto.envelope import CustomerCipher
 from ..crypto.kms import KeyManager, dek_aad, zeroize
 from ..payments.gateway import CardDetails, CardToken, PaymentError, PaymentGateway
 from ..payments.sca import HintType
-from ..store.models import ConsentRecord, CustomerProfile, shard_key
+from ..store.models import ConsentRecord, CustomerProfile, PalmTemplate, shard_key
 from ..store.repository import Repository
+from .credentials import CredentialService
 
 FIELD_TEMPLATE = "biometric_template"
 FIELD_PAYMENT_TOKEN = "payment_token"
@@ -85,6 +86,9 @@ class ConsentGrant:
 @dataclass
 class EnrollmentResult:
     customer_id: str
+    # The device credential, in plaintext. This is the only time it exists
+    # outside the enrolling device -- it is never stored or returned again.
+    credential: str
     engine_id: str
     card_display: str
     card_scheme: str
@@ -101,6 +105,7 @@ class EnrollmentService:
     engine: BiometricEngine
     gateway: PaymentGateway
     settings: Settings
+    credentials: CredentialService
     liveness_config: LivenessConfig = field(default_factory=LivenessConfig)
 
     # -- consent --------------------------------------------------------------
@@ -176,6 +181,7 @@ class EnrollmentService:
         card: CardDetails,
         pii: dict,
         consent: ConsentGrant,
+        device_label: str = "",
     ) -> EnrollmentResult:
         self._check_consent(consent)
 
@@ -215,7 +221,7 @@ class EnrollmentService:
             raise EnrollmentError("card_rejected", str(exc)) from exc
 
         shard = shard_key(self.settings.resolve_pepper(), hint)
-        profile = self._seal_profile(
+        profile, sealed_template = self._seal_profile(
             customer_id=customer_id,
             shard=shard,
             hint_type=hint_type,
@@ -225,6 +231,15 @@ class EnrollmentService:
         )
 
         self.repository.create_profile(profile)
+        self.repository.add_template(
+            PalmTemplate(
+                template_id=f"tpl_{uuid.uuid4().hex[:20]}",
+                customer_id=customer_id,
+                engine_id=self.engine.engine_id,
+                enc_template=sealed_template,
+                label="primary",
+            )
+        )
         self.repository.record_consent(
             ConsentRecord(
                 consent_id=f"con_{uuid.uuid4().hex[:20]}",
@@ -234,6 +249,24 @@ class EnrollmentService:
                 evidence_digest=consent.digest(),
             )
         )
+        issued = self.credentials.issue(customer_id, device_label=device_label)
+
+        shard_size = self.repository.count_in_shard(shard)
+        pressure_at = self.settings.max_candidates * self.settings.shard_pressure_ratio
+        if shard_size >= pressure_at:
+            # PD-17: warn while the shard is still usable. Once it passes
+            # max_candidates, identification refuses outright and the symptom
+            # is a customer standing at a till unable to pay.
+            self.repository.append_audit(
+                event_type="shard_pressure",
+                outcome="warning",
+                detail={
+                    "shard_size": shard_size,
+                    "limit": self.settings.max_candidates,
+                    "advice": "pay codes are not narrowing enough; lengthen them",
+                },
+            )
+
         self.repository.append_audit(
             event_type="enrollment",
             outcome="success",
@@ -244,12 +277,13 @@ class EnrollmentService:
                 "max_pairwise_distance": round(worst_distance, 5),
                 "card": token.display(),
                 "hint_type": hint_type.value,
-                "shard_size_after": self.repository.count_in_shard(shard),
+                "shard_size_after": shard_size,
             },
         )
 
         return EnrollmentResult(
             customer_id=customer_id,
+            credential=issued.bearer_token,
             engine_id=self.engine.engine_id,
             card_display=token.display(),
             card_scheme=token.scheme.value,
@@ -268,8 +302,12 @@ class EnrollmentService:
         template: Template,
         token: CardToken,
         pii: dict,
-    ) -> CustomerProfile:
-        """Generate the customer DEK and seal everything under it."""
+    ) -> tuple[CustomerProfile, bytes]:
+        """Generate the customer DEK and seal everything under it.
+
+        Returns the profile and the sealed template separately, because the
+        template now lives in its own table (PD-21).
+        """
         dek = self.kms.generate_dek()
         try:
             wrapped = self.kms.wrap_dek(bytes(dek), dek_aad(customer_id))
@@ -278,17 +316,7 @@ class EnrollmentService:
                 enc_template = cipher.seal(FIELD_TEMPLATE, template.serialize())
                 enc_token = cipher.seal(
                     FIELD_PAYMENT_TOKEN,
-                    json.dumps(
-                        {
-                            "token": token.token,
-                            "scheme": token.scheme.value,
-                            "last4": token.last4,
-                            "exp_month": token.exp_month,
-                            "exp_year": token.exp_year,
-                            "scheme_reference": token.scheme_reference,
-                        },
-                        separators=(",", ":"),
-                    ).encode("utf-8"),
+                    json.dumps(token.to_payload(), separators=(",", ":")).encode("utf-8"),
                 )
                 enc_pii = cipher.seal(
                     FIELD_PII, json.dumps(pii, separators=(",", ":")).encode("utf-8")
@@ -298,16 +326,108 @@ class EnrollmentService:
         finally:
             zeroize(dek)
 
-        return CustomerProfile(
-            customer_id=customer_id,
-            shard=shard,
-            engine_id=self.engine.engine_id,
-            wrapped_dek=wrapped.serialize(),
-            enc_template=enc_template,
-            enc_payment_token=enc_token,
-            enc_pii=enc_pii,
-            hint_type=hint_type.value,
+        return (
+            CustomerProfile(
+                customer_id=customer_id,
+                shard=shard,
+                engine_id=self.engine.engine_id,
+                wrapped_dek=wrapped.serialize(),
+                enc_payment_token=enc_token,
+                enc_pii=enc_pii,
+                hint_type=hint_type.value,
+            ),
+            enc_template,
         )
+
+    def add_palm(
+        self, *, customer_id: str, frames: list[np.ndarray], label: str
+    ) -> int:
+        """Enrol an additional hand for an existing customer (PD-21).
+
+        Same quality and consistency gates as first enrollment -- a second hand
+        is a full identity credential, not an afterthought. Consent is not
+        re-collected: the existing grant already covers biometric processing
+        for this customer, and this adds no new purpose.
+
+        Returns the number of palms now enrolled.
+        """
+        profile = self.repository.get_profile(customer_id)
+        if profile is None or not profile.is_active:
+            raise EnrollmentError("not_found", "no active profile for this customer")
+        if not profile.wrapped_dek:
+            raise EnrollmentError("profile_unavailable", "customer key material is unavailable")
+
+        existing = self.repository.templates_for(customer_id)
+        if any(t.label == label for t in existing):
+            raise EnrollmentError(
+                "duplicate_palm", f"a palm labelled {label} is already enrolled"
+            )
+
+        expected = self.settings.enrollment_samples
+        if len(frames) < expected:
+            raise EnrollmentError(
+                "insufficient_samples",
+                f"{expected} palm samples are required, got {len(frames)}",
+                {"required": expected, "received": len(frames)},
+            )
+
+        templates = [self._template_from_frame(f, i)[0] for i, f in enumerate(frames, 1)]
+        reference, worst = self._select_reference(templates)
+        if worst > self.settings.enrollment_consistency_max:
+            raise EnrollmentError(
+                "inconsistent_samples",
+                "the palm samples do not agree with each other",
+                {"max_pairwise_distance": round(worst, 5)},
+            )
+
+        # The new hand must not look like one already enrolled: if it did, the
+        # customer has scanned the same palm twice and the margin check at pay
+        # time would refuse them as ambiguous.
+        cipher = self._open_cipher(profile)
+        try:
+            for stored in existing:
+                if stored.engine_id != self.engine.engine_id:
+                    continue
+                previous = Template.deserialize(
+                    cipher.open(FIELD_TEMPLATE, stored.enc_template)
+                )
+                if self.engine.matcher.distance(reference, previous) <= self.engine.matcher.threshold:
+                    raise EnrollmentError(
+                        "same_palm",
+                        "that looks like a palm you have already enrolled; "
+                        "use your other hand",
+                        {"matches_label": stored.label},
+                    )
+            sealed = cipher.seal(FIELD_TEMPLATE, reference.serialize())
+        finally:
+            cipher.close()
+
+        self.repository.add_template(
+            PalmTemplate(
+                template_id=f"tpl_{uuid.uuid4().hex[:20]}",
+                customer_id=customer_id,
+                engine_id=self.engine.engine_id,
+                enc_template=sealed,
+                label=label,
+            )
+        )
+        self.repository.append_audit(
+            event_type="palm_added",
+            outcome="success",
+            customer_id=customer_id,
+            detail={"label": label, "palms_enrolled": len(existing) + 1},
+        )
+        return len(existing) + 1
+
+    def _open_cipher(self, profile: CustomerProfile) -> CustomerCipher:
+        from ..crypto.kms import KeyDestroyedError, WrappedKey
+
+        try:
+            wrapped = WrappedKey.deserialize(profile.wrapped_dek)
+            dek = self.kms.unwrap_dek(wrapped, dek_aad(profile.customer_id))
+        except (KeyDestroyedError, ValueError) as exc:
+            raise EnrollmentError("profile_unavailable", "customer key is unreadable") from exc
+        return CustomerCipher(customer_id=profile.customer_id, dek=dek)
 
     def delete_customer(self, customer_id: str) -> bool:
         """Erase a customer by crypto-shred.
@@ -320,6 +440,9 @@ class EnrollmentService:
         shredded = self.repository.crypto_shred(customer_id)
         if shredded:
             self.repository.withdraw_consent(customer_id)
+            # Otherwise a device still holding a credential could keep
+            # authenticating against the shredded profile.
+            self.credentials.revoke_all(customer_id)
             self.repository.append_audit(
                 event_type="erasure",
                 outcome="success",

@@ -101,7 +101,12 @@ class TestEnrollment:
     def test_nothing_sensitive_is_stored_in_the_clear(self, services, consent, visa_card):
         result = enroll(services, consent, visa_card)
         profile = services.repository.get_profile(result.customer_id)
-        blob = profile.enc_template + profile.enc_payment_token + profile.enc_pii
+        templates = services.repository.templates_for(result.customer_id)
+        blob = (
+            b"".join(t.enc_template for t in templates)
+            + profile.enc_payment_token
+            + profile.enc_pii
+        )
         assert TEST_CARDS["visa_ok"].encode() not in blob
         assert b"Person 1" not in blob
         assert b"@example.it" not in blob
@@ -299,8 +304,8 @@ class TestErasure:
         profile = services.repository.get_profile(enrolled.customer_id)
         assert profile.status is ProfileStatus.SHREDDED
         assert profile.wrapped_dek == b""
-        assert profile.enc_template == b""
         assert profile.enc_payment_token == b""
+        assert services.repository.templates_for(enrolled.customer_id) == []
 
     def test_consent_proof_survives_erasure(self, services, consent, visa_card):
         """Deleting the proof would destroy the basis for lawful processing."""

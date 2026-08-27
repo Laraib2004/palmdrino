@@ -61,6 +61,9 @@ object PalmdrinoClient {
             }
         }
 
+        // Terminal grant only. The customer grant is passed per call as an
+        // explicit Authorization header, so a credential is never attached to
+        // the open endpoints (enroll, capture-check) by accident.
         val apiKeyInterceptor = Interceptor { chain ->
             val key = apiKey
             val request = if (key.isNullOrBlank()) {
@@ -89,9 +92,16 @@ object PalmdrinoClient {
             .create(PalmdrinoApi::class.java)
     }
 
-    /** Optional API key, matching `PALMPAY_API_KEY` on the server. */
+    /** Terminal API key, matching `PALMPAY_API_KEY` on the server.
+     *
+     * Terminal builds load this from [SecureStore] at startup; customer builds
+     * never set it, because a customer grant cannot take payments (D8).
+     */
     @Volatile
     var apiKey: String? = null
+
+    /** Format a stored credential as an Authorization header value. */
+    fun bearer(credential: String): String = "Bearer $credential"
 
     /**
      * Runs an API call, normalising every failure mode into [ApiException].
@@ -132,6 +142,7 @@ class ApiSettings(context: Context) {
             ?: BuildConfig.DEFAULT_API_BASE_URL
         set(value) = prefs.edit().putString(KEY_BASE_URL, value.trim()).apply()
 
+    /** Terminal builds only: which merchant this till belongs to. */
     var merchantId: String
         get() = prefs.getString(KEY_MERCHANT, "mrc_demo_terminal") ?: "mrc_demo_terminal"
         set(value) = prefs.edit().putString(KEY_MERCHANT, value.trim()).apply()

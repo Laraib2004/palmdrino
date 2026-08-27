@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     # Ceiling on candidates per shard. A shard larger than this means the
     # identifier hint is not narrowing enough and 1:N accuracy is degrading.
     max_candidates: int = 64
+    # PD-17: fraction of max_candidates at which a shard starts being reported
+    # as under pressure. Refusing only at the cap means the first sign of
+    # trouble is a customer who cannot pay; this gives warning while there is
+    # still time to lengthen pay codes.
+    shard_pressure_ratio: float = 0.75
 
     # -- capture policy -------------------------------------------------------
     require_liveness: bool = True

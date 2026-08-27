@@ -198,6 +198,14 @@ class SoftwareKms:
 
     # -- lifecycle ------------------------------------------------------------
 
+    def known_kek_ids(self) -> list[str]:
+        """Every KEK still held, active or retired.
+
+        Lets a maintenance pass work out which retired KEKs no profile still
+        references and can therefore be destroyed (PD-14).
+        """
+        return sorted(self._keks)
+
     def rotate_kek(self) -> str:
         """Introduce a new active KEK, retaining old ones for unwrapping.
 

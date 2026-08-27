@@ -78,6 +78,9 @@ def main() -> int:
             f"  {name:14} -> {result.customer_id}  {result.card_display:22}"
             f"  sample agreement {result.max_pairwise_distance:.3f}"
         )
+    print()
+    print("  Each customer also received a device credential, returned once")
+    print("  and stored only as a hash (D8).")
 
     shard = services.repository.get_profile(enrolled[1].customer_id).shard
     print(f"\n  Three customers share pay code 4821; that shard holds "
@@ -145,7 +148,7 @@ def main() -> int:
     profile = services.repository.get_profile(victim)
     print(f"  {victim} status: {profile.status.value}")
     print(f"  wrapped DEK bytes remaining: {len(profile.wrapped_dek)}")
-    print(f"  encrypted template bytes remaining: {len(profile.enc_template)}")
+    print(f"  enrolled palms remaining: {len(services.repository.templates_for(victim))}")
     try:
         services.payment.pay(
             frame=sample(1, seed=7),

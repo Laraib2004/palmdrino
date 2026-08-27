@@ -18,7 +18,7 @@ from palmpay.payments.sca import (
     Exemption,
     FactorCategory,
     HintType,
-    LowValueTracker,
+    InMemoryLowValueTracker,
     assess,
     hint_factor,
     palm_factor,
@@ -255,14 +255,14 @@ class TestSCA:
             [palm_factor(0.10, 0.34, True)],
             customer_id="cus_1",
             amount_minor=1500,
-            tracker=LowValueTracker(),
+            tracker=InMemoryLowValueTracker(),
         )
         assert result.may_proceed
         assert result.exemption is Exemption.LOW_VALUE
 
     def test_low_value_exemption_exhausts(self):
         """PSD2 caps the exemption at 5 transactions or EUR 150 cumulative."""
-        tracker = LowValueTracker()
+        tracker = InMemoryLowValueTracker()
         for _ in range(5):
             result = assess(
                 [palm_factor(0.10, 0.34, True)],
@@ -282,7 +282,7 @@ class TestSCA:
         assert not exhausted.may_proceed
 
     def test_low_value_exemption_respects_cumulative_cap(self):
-        tracker = LowValueTracker()
+        tracker = InMemoryLowValueTracker()
         tracker.record_exempt("cus_1", 14_500)
         result = assess(
             [palm_factor(0.10, 0.34, True)],

@@ -21,6 +21,12 @@ def utc_now() -> datetime:
 
 class ProfileStatus(str, Enum):
     ACTIVE = "active"
+    # PD-22: consent withdrawn, biometric processing stopped, data still
+    # present. Distinct from SHREDDED because withdrawing consent and erasing
+    # data are different rights and a customer may want the first without the
+    # second. How long a suspended profile may be retained before erasure is a
+    # question for PD-01, not one to guess at here.
+    SUSPENDED = "suspended"
     SHREDDED = "shredded"
 
 
@@ -44,6 +50,67 @@ def shard_key(pepper: bytes, hint: str) -> str:
     return hmac.new(pepper, normalised.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def credential_hash(pepper: bytes, secret: str) -> str:
+    """Hash a device credential for storage.
+
+    A plain keyed hash rather than a password KDF, deliberately: the secret is
+    32 random bytes issued by the server, not something a human chose. There is
+    no dictionary to attack and nothing for bcrypt-style stretching to buy. What
+    matters is that the database never holds the usable value.
+
+    Domain-separated from ``shard_key`` so the same pepper cannot produce a
+    collision between a hint hash and a credential hash.
+    """
+    return hmac.new(
+        pepper, f"credential:v1:{secret}".encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+@dataclass
+class CustomerCredential:
+    """Proves a caller is the customer they claim to be.
+
+    Issued once at enrollment and bound to the device that enrolled. Stored as
+    a hash only -- a database leak yields nothing that can be replayed.
+
+    Modelled as its own record rather than a column on the profile so that a
+    second device, or rotation after a suspected compromise, is an insert and a
+    revoke rather than a schema change.
+    """
+
+    credential_id: str
+    customer_id: str
+    token_hash: str
+    device_label: str = ""
+    created_at: datetime = field(default_factory=utc_now)
+    revoked_at: datetime | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.revoked_at is None
+
+
+@dataclass
+class PalmTemplate:
+    """One enrolled hand (PD-21).
+
+    A customer may enrol more than one palm, so that a bandaged or injured hand
+    does not leave them unable to pay. Templates live in their own table rather
+    than as a column on the profile because there is genuinely more than one.
+
+    ``engine_id`` is authoritative here rather than on the profile: an engine
+    upgrade can be rolled out hand by hand, and only templates from the current
+    engine are comparable.
+    """
+
+    template_id: str
+    customer_id: str
+    engine_id: str
+    enc_template: bytes
+    label: str = "primary"
+    created_at: datetime = field(default_factory=utc_now)
+
+
 @dataclass
 class CustomerProfile:
     """An enrolled customer.
@@ -57,7 +124,6 @@ class CustomerProfile:
     shard: str
     engine_id: str
     wrapped_dek: bytes
-    enc_template: bytes
     enc_payment_token: bytes
     enc_pii: bytes
     # Whether the identifier hint is a user-chosen secret or a public

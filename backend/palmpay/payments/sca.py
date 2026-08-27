@@ -43,6 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import Protocol
 
 from ..store.models import utc_now
 
@@ -132,35 +133,53 @@ def hint_factor(hint_type: HintType) -> AuthenticationFactor | None:
     )
 
 
-@dataclass
-class LowValueTracker:
+class LowValueTracker(Protocol):
     """Per-customer counters for the PSD2 low-value exemption.
 
-    In-memory here, which is correct for the prototype and wrong for
-    production: these counters are a fraud control and must be durable and
-    shared across terminals, or the same customer resets their allowance by
-    walking to the next till.
+    A fraud control, so it must be durable and shared across terminals. See
+    ``DurableLowValueTracker`` in services/payment.py for the real one; the
+    in-memory implementation below exists only for unit tests that do not want
+    a database.
     """
+
+    def would_qualify(self, customer_id: str, amount_minor: int) -> bool: ...
+
+    def record_exempt(self, customer_id: str, amount_minor: int) -> None: ...
+
+    def reset(self, customer_id: str) -> None: ...
+
+
+def within_low_value_limits(used_minor: int, used_count: int, amount_minor: int) -> bool:
+    """The PSD2 RTS Art. 16 test, in one place so both trackers agree."""
+    if amount_minor > LOW_VALUE_MAX_AMOUNT:
+        return False
+    return (
+        used_minor + amount_minor <= LOW_VALUE_CUMULATIVE_MAX
+        and used_count + 1 <= LOW_VALUE_MAX_COUNT
+    )
+
+
+@dataclass
+class InMemoryLowValueTracker:
+    """Test double. Not for production -- it forgets on restart."""
 
     cumulative_minor: dict[str, int] = field(default_factory=dict)
     count: dict[str, int] = field(default_factory=dict)
 
     def would_qualify(self, customer_id: str, amount_minor: int) -> bool:
-        if amount_minor > LOW_VALUE_MAX_AMOUNT:
-            return False
-        used = self.cumulative_minor.get(customer_id, 0)
-        seen = self.count.get(customer_id, 0)
-        return (
-            used + amount_minor <= LOW_VALUE_CUMULATIVE_MAX
-            and seen + 1 <= LOW_VALUE_MAX_COUNT
+        return within_low_value_limits(
+            self.cumulative_minor.get(customer_id, 0),
+            self.count.get(customer_id, 0),
+            amount_minor,
         )
 
     def record_exempt(self, customer_id: str, amount_minor: int) -> None:
-        self.cumulative_minor[customer_id] = self.cumulative_minor.get(customer_id, 0) + amount_minor
+        self.cumulative_minor[customer_id] = (
+            self.cumulative_minor.get(customer_id, 0) + amount_minor
+        )
         self.count[customer_id] = self.count.get(customer_id, 0) + 1
 
     def reset(self, customer_id: str) -> None:
-        """Called after a strongly authenticated transaction clears the counters."""
         self.cumulative_minor.pop(customer_id, None)
         self.count.pop(customer_id, None)
 

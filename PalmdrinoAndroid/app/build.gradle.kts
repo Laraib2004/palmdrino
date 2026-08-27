@@ -24,6 +24,26 @@ android {
         buildConfigField("String", "DEFAULT_API_BASE_URL", "\"http://10.0.2.2:8000/\"")
     }
 
+    // PD-27: the customer app and the merchant terminal are different products
+    // for different people. Separating them as flavours means a customer build
+    // physically cannot contain the payment-taking screen, rather than merely
+    // hiding it -- and the two can be signed and distributed independently.
+    flavorDimensions += "surface"
+    productFlavors {
+        create("customer") {
+            dimension = "surface"
+            applicationIdSuffix = ".customer"
+            versionNameSuffix = "-customer"
+            resValue("string", "app_name", "Palmdrino")
+        }
+        create("terminal") {
+            dimension = "surface"
+            applicationIdSuffix = ".terminal"
+            versionNameSuffix = "-terminal"
+            resValue("string", "app_name", "Palmdrino Terminal")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -52,6 +72,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.androidx.security.crypto)
 
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
